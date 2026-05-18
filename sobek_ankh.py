@@ -18,13 +18,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Original 5
-from strategies.funding_rate_arb import run as run_funding_arb
-from strategies.cross_exchange_arb import run as run_cross_arb
+# NOTE: funding_rate_arb, cross_exchange_arb, stat_arb are removed (0 PnL after hundreds of cycles)
 from strategies.grid_trading import run as run_grid
-from strategies.stat_arb import run as run_stat_arb
 from strategies.multi_factor import run as run_multi_factor
 
-# New 10
+# Active strategies (removed dead ones: cross_exchange_arb, stat_arb, funding_rate_arb)
 from strategies.momentum_scalp import run as run_momentum_scalp
 from strategies.mean_reversion import run as run_mean_reversion
 from strategies.breakout_hunter import run as run_breakout_hunter
@@ -60,9 +58,14 @@ CAPITAL = float(os.getenv("SOBEK_CAPITAL", "1000.0"))
 SIMULATE_MODE = os.getenv("SIMULATE_MODE", "true").lower() == "true"
 CYCLE_INTERVAL = int(os.getenv("CYCLE_INTERVAL", "300"))
 
+# Dead strategies removed (0 PnL after hundreds of cycles):
+# - cross_exchange_arb: removed
+# - stat_arb: removed
+# - funding_rate_arb: removed
+# Now running 12 strategies instead of 15
+
 STRATEGIES = {
     "momentum_scalp":     {"fn": run_momentum_scalp,    "interval": 60,    "last_run": 0},
-    "cross_arb":          {"fn": run_cross_arb,          "interval": 60,    "last_run": 0},
     "liquidation_sniper": {"fn": run_liquidation_sniper, "interval": 120,   "last_run": 0},
     "mean_reversion":     {"fn": run_mean_reversion,     "interval": 300,   "last_run": 0},
     "grid_trading":       {"fn": run_grid,               "interval": 300,   "last_run": 0},
@@ -71,13 +74,25 @@ STRATEGIES = {
     "dca_engine":         {"fn": run_dca_engine,         "interval": 900,   "last_run": 0},
     "volatility_harvest": {"fn": run_volatility_harvest, "interval": 900,   "last_run": 0},
     "options_flow":       {"fn": run_options_flow,       "interval": 1800,  "last_run": 0},
-    "stat_arb":           {"fn": run_stat_arb,           "interval": 1800,  "last_run": 0},
     "on_chain_alpha":     {"fn": run_on_chain_alpha,     "interval": 1800,  "last_run": 0},
     "pairs_rotation":     {"fn": run_pairs_rotation,     "interval": 3600,  "last_run": 0},
-    "funding_arb":        {"fn": run_funding_arb,        "interval": 28800, "last_run": 0},
     "multi_factor":       {"fn": run_multi_factor,       "interval": 86400, "last_run": 0},
 }
 
+# Market Regime - Strategy mapping for AI Intelligence Layer
+REGIME_STRATEGIES = {
+    "BULL_EUPHORIA": ["momentum_scalp", "breakout_hunter", "liquidation_sniper", "multi_factor"],
+    "BEAR_FEAR": ["mean_reversion", "dca_engine", "on_chain_alpha", "grid_trading"],
+    "TRENDING": ["momentum_scalp", "breakout_hunter", "volatility_harvest", "liquidation_sniper"],
+    "RANGING": ["grid_trading", "mean_reversion", "dca_engine", "pairs_rotation"],
+    "NEUTRAL": ["momentum_scalp", "mean_reversion", "multi_factor", "pairs_rotation"]
+}
+
+# AI Intelligence Configuration
+MIN_WIN_RATE_THRESHOLD = 0.40
+WIN_RATE_HIGH_THRESHOLD = 0.60
+WIN_RATE_LOW_THRESHOLD = 0.40
+SELF_HEAL_COOLDOWN = 1800  # 30 minutes
 
 def get_position_size(name: str, config: dict) -> float:
     """
@@ -117,6 +132,24 @@ def process_results(name: str, results, config: dict):
         pair = trade.get("pair", name)
         wt   = trade["weight"]
         emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
+        
+        # Send Telegram notification for every closed trade
+        timestamp = trade.get("ts", time.time())
+        from datetime import datetime
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        
+        win_loss = "WIN" if pnl > 0 else "LOSS"
+        send_alert(
+            f"📊 Trade Closed\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🏷️ Strategy: {name}\n"
+            f"💵 Entry: ${trade.get('entry', 0):.4f}\n"
+            f"💰 Exit: ${trade.get('exit', 0):.4f}\n"
+            f"📈 PnL: {pnl:+.4f} USDT\n"
+            f"✅ Result: {win_loss}\n"
+            f"⏰ {ts}"
+        )
+        
         print(f"  {emoji} [{name}] {pair} | PnL: {pnl:+.4f} USDT | weight: {wt}")
 
     # Trigger SAFLA review if threshold reached
@@ -189,11 +222,12 @@ def main():
 ║   Pantheon | Ankh Series                ║
 ║   Mode: {mode:<30} ║
 ║   Capital: ${CAPITAL:<28.2f} ║
-║   Strategies: 15 Active                 ║
+║   Strategies: 12 Active                 ║
 ║   Regime: {regime:<29} ║
 ║   SAFLA Reviews: {reviews:<22} ║
 ║   Meta Watcher: ACTIVE                  ║
 ║   Risk Engine: ARMED                    ║
+║   AI Intelligence: ENABLED             ║
 ╚══════════════════════════════════════════╝
     """)
 
@@ -203,8 +237,8 @@ def main():
         f"Capital: ${CAPITAL:.2f}\n"
         f"Regime: {regime}\n"
         f"SAFLA: ACTIVE ({reviews} reviews)\n"
-        f"Meta Watcher: WATCHING\n"
-        f"15 strategies. Living. Learning.\n"
+        f"AI Intelligence: ENABLED\n"
+        f"12 strategies. Living. Learning.\n"
         f"The Nile flows. 🔱"
     )
 
