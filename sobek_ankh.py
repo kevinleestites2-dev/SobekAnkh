@@ -3,9 +3,7 @@ Sobek Ankh — The Trader
 Pantheon | Ankh Series
 15 strategies. 100+ exchanges. Full risk engine. Never blows up.
 
-v2.0 — Meta+SAFLA wired in.
-Reads sobek_config.json for weights. SAFLA reviews every 50 trades.
-The Watcher above rewrites the config. Sobek just executes.
+v2.1 — Fixed SAFLA feed: only real trades (pnl != 0) counted.
 
 "The waters of the Nile do not ask permission to flow." — Sobek
 """
@@ -17,12 +15,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Original 5
-# NOTE: funding_rate_arb, cross_exchange_arb, stat_arb are removed (0 PnL after hundreds of cycles)
 from strategies.grid_trading import run as run_grid
 from strategies.multi_factor import run as run_multi_factor
-
-# Active strategies (removed dead ones: cross_exchange_arb, stat_arb, funding_rate_arb)
 from strategies.momentum_scalp import run as run_momentum_scalp
 from strategies.mean_reversion import run as run_mean_reversion
 from strategies.breakout_hunter import run as run_breakout_hunter
@@ -37,14 +31,11 @@ from strategies.volatility_harvest import run as run_volatility_harvest
 from risk.risk_engine import get_risk_status
 from utils.telegram_alert import send_alert, send_profit_report
 from utils.midas_log import log_trade, get_war_chest
-
-# ── Meta + SAFLA ──────────────────────────────────────────────
 from sobek_safla import run_safla_check, append_trade
 
 CONFIG_PATH = Path("sobek_config.json")
 
 def load_config() -> dict:
-    """Load sobek_config.json — reloaded every cycle so Meta Watcher changes take effect."""
     if CONFIG_PATH.exists():
         try:
             return json.loads(CONFIG_PATH.read_text())
@@ -52,20 +43,12 @@ def load_config() -> dict:
             pass
     return {"strategy_weights": {}, "safla": {"enabled": False}, "regime": "NEUTRAL"}
 
-# ─────────────────────────────────────────────────────────────
-
 CAPITAL = float(os.getenv("SOBEK_CAPITAL", "1000.0"))
 SIMULATE_MODE = os.getenv("SIMULATE_MODE", "true").lower() == "true"
 CYCLE_INTERVAL = int(os.getenv("CYCLE_INTERVAL", "300"))
 
-# Dead strategies removed (0 PnL after hundreds of cycles):
-# - cross_exchange_arb: removed
-# - stat_arb: removed
-# - funding_rate_arb: removed
-# Now running 12 strategies instead of 15
-
 STRATEGIES = {
-    "momentum_scalp":     {"fn": run_momentum_scalp,    "interval": 60,    "last_run": 0},
+    "momentum_scalp":     {"fn": run_momentum_scalp,     "interval": 60,    "last_run": 0},
     "liquidation_sniper": {"fn": run_liquidation_sniper, "interval": 120,   "last_run": 0},
     "mean_reversion":     {"fn": run_mean_reversion,     "interval": 300,   "last_run": 0},
     "grid_trading":       {"fn": run_grid,               "interval": 300,   "last_run": 0},
@@ -79,26 +62,7 @@ STRATEGIES = {
     "multi_factor":       {"fn": run_multi_factor,       "interval": 86400, "last_run": 0},
 }
 
-# Market Regime - Strategy mapping for AI Intelligence Layer
-REGIME_STRATEGIES = {
-    "BULL_EUPHORIA": ["momentum_scalp", "breakout_hunter", "liquidation_sniper", "multi_factor"],
-    "BEAR_FEAR": ["mean_reversion", "dca_engine", "on_chain_alpha", "grid_trading"],
-    "TRENDING": ["momentum_scalp", "breakout_hunter", "volatility_harvest", "liquidation_sniper"],
-    "RANGING": ["grid_trading", "mean_reversion", "dca_engine", "pairs_rotation"],
-    "NEUTRAL": ["momentum_scalp", "mean_reversion", "multi_factor", "pairs_rotation"]
-}
-
-# AI Intelligence Configuration
-MIN_WIN_RATE_THRESHOLD = 0.40
-WIN_RATE_HIGH_THRESHOLD = 0.60
-WIN_RATE_LOW_THRESHOLD = 0.40
-SELF_HEAL_COOLDOWN = 1800  # 30 minutes
-
 def get_position_size(name: str, config: dict) -> float:
-    """
-    Base capital * weight from config * conviction score.
-    Sobek sizes positions by what the Meta layer says — not flat allocation.
-    """
     weights = config.get("strategy_weights", {})
     weight  = weights.get(name, 1.0)
     base    = config.get("risk", {}).get("base_position_pct", 0.02)
@@ -106,39 +70,47 @@ def get_position_size(name: str, config: dict) -> float:
 
 
 def process_results(name: str, results, config: dict):
-    """Log all trade results. Feed each trade to SAFLA."""
+    """
+    Log all trade results. Feed ONLY real trades (pnl != 0) to SAFLA.
+
+    THE FIX: Blocked/no-signal returns come back as pnl=0.
+    Feeding them to SAFLA poisoned the memory with 5,800+ zero-PnL
+    ghost trades, making every win rate read 0.0%. Filtered here.
+    """
     if not results:
         return
     if isinstance(results, dict):
         results = [results]
 
+    real_trades = 0
     for trade in results:
         if not isinstance(trade, dict):
             continue
         if "pnl" not in trade:
             continue
 
+        pnl = float(trade.get("pnl", 0))
+
+        # KEY FIX: skip zero-pnl / blocked / no-signal returns
+        if pnl == 0:
+            continue
+
         trade["strategy"] = trade.get("strategy", name)
         trade["regime"]   = config.get("regime", "NEUTRAL")
         trade["weight"]   = config.get("strategy_weights", {}).get(name, 1.0)
 
-        # Log to War Chest
         log_trade(trade)
-
-        # Feed to SAFLA memory
         append_trade(trade)
+        real_trades += 1
 
-        pnl  = trade["pnl"]
-        pair = trade.get("pair", name)
-        wt   = trade["weight"]
-        emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
-        
-        # Send Telegram notification for every closed trade
-        timestamp = trade.get("ts", time.time())
+        pair    = trade.get("pair", name)
+        wt      = trade["weight"]
+        emoji   = "🟢" if pnl > 0 else "🔴"
+        outcome = "WIN" if pnl > 0 else "LOSS"
+
         from datetime import datetime
         ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        
-        win_loss = "WIN" if pnl > 0 else "LOSS"
+
         send_alert(
             f"📊 Trade Closed\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
@@ -146,14 +118,15 @@ def process_results(name: str, results, config: dict):
             f"💵 Entry: ${trade.get('entry', 0):.4f}\n"
             f"💰 Exit: ${trade.get('exit', 0):.4f}\n"
             f"📈 PnL: {pnl:+.4f} USDT\n"
-            f"✅ Result: {win_loss}\n"
+            f"✅ Result: {outcome}\n"
             f"⏰ {ts}"
         )
-        
+
         print(f"  {emoji} [{name}] {pair} | PnL: {pnl:+.4f} USDT | weight: {wt}")
 
-    # Trigger SAFLA review if threshold reached
-    run_safla_check()
+    # Only trigger SAFLA when real trades fired
+    if real_trades > 0:
+        run_safla_check()
 
 
 def run_cycle(config: dict):
@@ -166,7 +139,6 @@ def run_cycle(config: dict):
 
     for name, cfg in STRATEGIES.items():
         if now - cfg["last_run"] >= cfg["interval"]:
-            # Dynamic position size — driven by Meta+SAFLA weight
             position = get_position_size(name, config)
             print(f"[SOBEK] Running: {name} | position: ${position:.2f} | regime: {config.get('regime','?')}")
             try:
@@ -211,34 +183,31 @@ def daily_report(config: dict):
 def main():
     mode = "SIMULATE" if SIMULATE_MODE else "LIVE"
 
-    # Load initial config
-    config = load_config()
-    regime = config.get("regime", "NEUTRAL")
+    config  = load_config()
+    regime  = config.get("regime", "NEUTRAL")
     reviews = config.get("safla", {}).get("total_reviews", 0)
 
     print(f"""
 ╔══════════════════════════════════════════╗
-║   🐊 SOBEK ANKH v2 — THE ORGANISM 🐊   ║
-║   Pantheon | Ankh Series                ║
-║   Mode: {mode:<30} ║
-║   Capital: ${CAPITAL:<28.2f} ║
-║   Strategies: 12 Active                 ║
-║   Regime: {regime:<29} ║
-║   SAFLA Reviews: {reviews:<22} ║
-║   Meta Watcher: ACTIVE                  ║
-║   Risk Engine: ARMED                    ║
-║   AI Intelligence: ENABLED             ║
+║  🐊 SOBEK ANKH v2.1 — THE ORGANISM 🐊  ║
+║  Pantheon | Ankh Series                 ║
+║  Mode: {mode:<31} ║
+║  Capital: ${CAPITAL:<29.2f} ║
+║  Strategies: 12 Active                  ║
+║  Regime: {regime:<30} ║
+║  SAFLA Reviews: {reviews:<23} ║
+║  Fix: Real trades only to SAFLA        ║
 ╚══════════════════════════════════════════╝
     """)
 
     send_alert(
-        f"🐊 SOBEK ANKH v2 ONLINE\n"
+        f"🐊 SOBEK ANKH v2.1 ONLINE\n"
         f"Mode: {mode}\n"
         f"Capital: ${CAPITAL:.2f}\n"
         f"Regime: {regime}\n"
         f"SAFLA: ACTIVE ({reviews} reviews)\n"
-        f"AI Intelligence: ENABLED\n"
-        f"12 strategies. Living. Learning.\n"
+        f"Fix: Zero-PnL noise filtered.\n"
+        f"SAFLA memory is clean. Real trades only.\n"
         f"The Nile flows. 🔱"
     )
 
@@ -249,7 +218,6 @@ def main():
         try:
             now = time.time()
 
-            # Reload config every 60s — picks up Meta Watcher changes silently
             if now - last_config_reload >= 60:
                 config = load_config()
                 last_config_reload = now
@@ -264,9 +232,9 @@ def main():
 
         except KeyboardInterrupt:
             print("\n[SOBEK] Shutting down gracefully.")
-            chest = get_war_chest()
-            pnl    = chest.get("total_pnl", 0.0)
-            trades = chest.get("total_trades", 0)
+            chest   = get_war_chest()
+            pnl     = chest.get("total_pnl", 0.0)
+            trades  = chest.get("total_trades", 0)
             reviews = config.get("safla", {}).get("total_reviews", 0)
             send_alert(
                 f"🐊 SOBEK offline — manual shutdown.\n"
