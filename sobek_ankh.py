@@ -1,9 +1,10 @@
 """
 Sobek Ankh — The Trader
 Pantheon | Ankh Series
-15 strategies. 100+ exchanges. Full risk engine. Never blows up.
+12 strategies. 100+ exchanges. Full risk engine. Never blows up.
 
-v2.1 — Fixed SAFLA feed: only real trades (pnl != 0) counted.
+v2.2 — Regime detection + SAFLA wired into main loop.
+       Ghost strategies (cross_arb, stat_arb, funding_arb) removed.
 
 "The waters of the Nile do not ask permission to flow." — Sobek
 """
@@ -32,6 +33,7 @@ from risk.risk_engine import get_risk_status
 from utils.telegram_alert import send_alert, send_profit_report
 from utils.midas_log import log_trade, get_war_chest
 from sobek_safla import run_safla_check, append_trade
+from sobek_meta import run_meta_watcher  # v2.2: wired in
 
 CONFIG_PATH = Path("sobek_config.json")
 
@@ -46,6 +48,7 @@ def load_config() -> dict:
 CAPITAL = float(os.getenv("SOBEK_CAPITAL", "1000.0"))
 SIMULATE_MODE = os.getenv("SIMULATE_MODE", "true").lower() == "true"
 CYCLE_INTERVAL = int(os.getenv("CYCLE_INTERVAL", "300"))
+META_INTERVAL  = 600   # regime detection every 10 minutes
 
 STRATEGIES = {
     "momentum_scalp":     {"fn": run_momentum_scalp,     "interval": 60,    "last_run": 0},
@@ -72,10 +75,7 @@ def get_position_size(name: str, config: dict) -> float:
 def process_results(name: str, results, config: dict):
     """
     Log all trade results. Feed ONLY real trades (pnl != 0) to SAFLA.
-
-    THE FIX: Blocked/no-signal returns come back as pnl=0.
-    Feeding them to SAFLA poisoned the memory with 5,800+ zero-PnL
-    ghost trades, making every win rate read 0.0%. Filtered here.
+    v2.1 fix: zero-PnL ghost trades filtered out before SAFLA.
     """
     if not results:
         return
@@ -90,8 +90,6 @@ def process_results(name: str, results, config: dict):
             continue
 
         pnl = float(trade.get("pnl", 0))
-
-        # KEY FIX: skip zero-pnl / blocked / no-signal returns
         if pnl == 0:
             continue
 
@@ -105,26 +103,25 @@ def process_results(name: str, results, config: dict):
 
         pair    = trade.get("pair", name)
         wt      = trade["weight"]
-        emoji   = "🟢" if pnl > 0 else "🔴"
+        emoji   = "\U0001f7e2" if pnl > 0 else "\U0001f534"
         outcome = "WIN" if pnl > 0 else "LOSS"
 
         from datetime import datetime
         ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
         send_alert(
-            f"📊 Trade Closed\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"🏷️ Strategy: {name}\n"
-            f"💵 Entry: ${trade.get('entry', 0):.4f}\n"
-            f"💰 Exit: ${trade.get('exit', 0):.4f}\n"
-            f"📈 PnL: {pnl:+.4f} USDT\n"
-            f"✅ Result: {outcome}\n"
-            f"⏰ {ts}"
+            f"\U0001f4ca Trade Closed\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"\U0001f3f7\ufe0f Strategy: {name}\n"
+            f"\U0001f4b5 Entry: ${trade.get('entry', 0):.4f}\n"
+            f"\U0001f4b0 Exit: ${trade.get('exit', 0):.4f}\n"
+            f"\U0001f4c8 PnL: {pnl:+.4f} USDT\n"
+            f"\u2705 Result: {outcome}\n"
+            f"\u23f0 {ts}"
         )
 
         print(f"  {emoji} [{name}] {pair} | PnL: {pnl:+.4f} USDT | weight: {wt}")
 
-    # Only trigger SAFLA when real trades fired
     if real_trades > 0:
         run_safla_check()
 
@@ -140,7 +137,7 @@ def run_cycle(config: dict):
     for name, cfg in STRATEGIES.items():
         if now - cfg["last_run"] >= cfg["interval"]:
             position = get_position_size(name, config)
-            print(f"[SOBEK] Running: {name} | position: ${position:.2f} | regime: {config.get('regime','?')}")
+            print(f"[SOBEK] Running: {name} | position: ${position:.2f} | regime: {config.get('regime','?')")
             try:
                 results = cfg["fn"](position)
                 process_results(name, results, config)
@@ -166,53 +163,71 @@ def daily_report(config: dict):
         top_data = strategies[top_name]
         top_weight = config.get("strategy_weights", {}).get(top_name, 1.0)
         send_alert(
-            f"📊 SOBEK DAILY REPORT\n"
-            f"━━━━━━━━━━━━━━━━━\n"
-            f"🌊 Regime: {regime}\n"
-            f"⚡ SAFLA Reviews: {reviews}\n"
-            f"━━━━━━━━━━━━━━━━━\n"
-            f"🏆 Top: {top_name}\n"
-            f"💰 PnL: {top_data['pnl']:+.4f} USDT\n"
-            f"📈 Trades: {top_data['trades']}\n"
-            f"⚖️  Weight: {top_weight}x\n"
-            f"━━━━━━━━━━━━━━━━━\n"
-            f"The Nile flows. 🐊🔱"
+            f"\U0001f4ca SOBEK DAILY REPORT\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"\U0001f30a Regime: {regime}\n"
+            f"\u26a1 SAFLA Reviews: {reviews}\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"\U0001f3c6 Top: {top_name}\n"
+            f"\U0001f4b0 PnL: {top_data['pnl']:+.4f} USDT\n"
+            f"\U0001f4c8 Trades: {top_data['trades']}\n"
+            f"\u2696\ufe0f  Weight: {top_weight}x\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"The Nile flows. \U0001f40a\U0001f531"
         )
 
 
 def main():
     mode = "SIMULATE" if SIMULATE_MODE else "LIVE"
 
+    # v2.2: Detect current market regime BEFORE first cycle
+    print("[SOBEK] v2.2 startup — detecting market regime...")
+    try:
+        run_meta_watcher(once=True)
+        print("[SOBEK] Regime detection complete.")
+    except Exception as e:
+        print(f"[SOBEK] Meta watcher error on startup: {e}")
+
     config  = load_config()
     regime  = config.get("regime", "NEUTRAL")
     reviews = config.get("safla", {}).get("total_reviews", 0)
 
+    # v2.2: Force SAFLA review on startup so learning begins immediately
+    print("[SOBEK] Running startup SAFLA review (forced)...")
+    try:
+        run_safla_check(force=True)
+        config = load_config()  # reload — SAFLA may have updated weights
+        reviews = config.get("safla", {}).get("total_reviews", 0)
+        print(f"[SOBEK] SAFLA review complete. Total reviews: {reviews}")
+    except Exception as e:
+        print(f"[SOBEK] SAFLA startup error: {e}")
+
     print(f"""
-╔══════════════════════════════════════════╗
-║  🐊 SOBEK ANKH v2.1 — THE ORGANISM 🐊  ║
-║  Pantheon | Ankh Series                 ║
-║  Mode: {mode:<31} ║
-║  Capital: ${CAPITAL:<29.2f} ║
-║  Strategies: 12 Active                  ║
-║  Regime: {regime:<30} ║
-║  SAFLA Reviews: {reviews:<23} ║
-║  Fix: Real trades only to SAFLA        ║
-╚══════════════════════════════════════════╝
+\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
+\u2551  \U0001f40a SOBEK ANKH v2.2 \u2014 THE ORGANISM \U0001f40a  \u2551
+\u2551  Pantheon | Ankh Series                 \u2551
+\u2551  Mode: {mode:<31} \u2551
+\u2551  Capital: ${CAPITAL:<29.2f} \u2551
+\u2551  Strategies: 12 Active                  \u2551
+\u2551  Regime: {regime:<30} \u2551
+\u2551  SAFLA Reviews: {reviews:<23} \u2551
+\u2551  v2.2: Regime + SAFLA live in loop      \u2551
+\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d
     """)
 
     send_alert(
-        f"🐊 SOBEK ANKH v2.1 ONLINE\n"
+        f"\U0001f40a SOBEK ANKH v2.2 ONLINE\n"
         f"Mode: {mode}\n"
         f"Capital: ${CAPITAL:.2f}\n"
-        f"Regime: {regime}\n"
+        f"Regime: {regime} (LIVE detection active)\n"
         f"SAFLA: ACTIVE ({reviews} reviews)\n"
-        f"Fix: Zero-PnL noise filtered.\n"
-        f"SAFLA memory is clean. Real trades only.\n"
-        f"The Nile flows. 🔱"
+        f"Regime wired. SAFLA wired. Ghost strategies removed.\n"
+        f"The Nile flows. \U0001f531"
     )
 
     last_daily_report  = 0
     last_config_reload = 0
+    last_meta_update   = 0  # v2.2
 
     while True:
         try:
@@ -221,6 +236,15 @@ def main():
             if now - last_config_reload >= 60:
                 config = load_config()
                 last_config_reload = now
+
+            # v2.2: Regime detection every 10 minutes
+            if now - last_meta_update >= META_INTERVAL:
+                try:
+                    run_meta_watcher(once=True)
+                    config = load_config()  # pick up new regime weights
+                except Exception as e:
+                    print(f"[SOBEK] Meta update error: {e}")
+                last_meta_update = now
 
             run_cycle(config)
 
@@ -237,16 +261,16 @@ def main():
             trades  = chest.get("total_trades", 0)
             reviews = config.get("safla", {}).get("total_reviews", 0)
             send_alert(
-                f"🐊 SOBEK offline — manual shutdown.\n"
+                f"\U0001f40a SOBEK offline \u2014 manual shutdown.\n"
                 f"Session PnL: {pnl:+.4f} USDT\n"
                 f"Total Trades: {trades}\n"
                 f"SAFLA Reviews: {reviews}\n"
-                f"For the War Chest. 🔱"
+                f"For the War Chest. \U0001f531"
             )
             break
         except Exception as e:
             print(f"[SOBEK] Cycle error: {e}")
-            send_alert(f"⚠️ SOBEK cycle error: {str(e)[:200]}")
+            send_alert(f"\u26a0\ufe0f SOBEK cycle error: {str(e)[:200]}")
             time.sleep(30)
 
 
